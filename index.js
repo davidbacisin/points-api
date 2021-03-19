@@ -54,7 +54,8 @@ function addTransaction({ userPoints, payer, points, timestamp }) {
     userPoints.push({
         payer,
         points,
-        timestamp: ts
+        timestamp: ts,
+        spent: 0
     })
 
     return {
@@ -68,13 +69,39 @@ function createSpendingPlan({ userPoints, points }) {
     const clonedPoints = [...userPoints]
     clonedPoints.sort(transactionByTimestampAscending)
 
+    // Remove negative transactions
+    const positivePoints = []
+    clonedPoints.forEach((transaction) => {
+        if (transaction.points > 0) {
+            // Create a copy of the transaction to avoid modifying the original
+            positivePoints.push({
+                payer: transaction.payer,
+                points: transaction.points,
+                timestamp: transaction.timestamp
+            })
+        }
+        else if (transaction.points < 0) {
+            // Neutralize negative points
+            let pointsLeftToNeutralize = -transaction.points
+
+            // positivePoints is already sorted, so just filter for this payer
+            const payerPoints = positivePoints.filter(pp => pp.payer === transaction.payer)
+            for (let i = 0; i < payerPoints.length && pointsLeftToNeutralize > 0; i++) {
+                const pointsToNeutralizeNow = Math.min(pointsLeftToNeutralize, payerPoints[i].points)
+                pointsLeftToNeutralize -= pointsToNeutralizeNow
+                payerPoints[i].points -= pointsToNeutralizeNow
+            }
+        }
+        // else skip 0 point transactions
+    })
+
     // Spend those points. Note that we have to check all transactions 
     // in case later transactions have actually spent points from earlier 
     // transactions
     let pointsLeftToSpend = points
     const payers = new Map()
-    for (let i = 0; i < clonedPoints.length; i++) {
-        let transaction = clonedPoints[i]
+    for (let i = 0; i < positivePoints.length && pointsLeftToSpend > 0; i++) {
+        let transaction = positivePoints[i]
 
         // We're going to spend these points. Initialize the payer in the payers Map
         if (!payers.has(transaction.payer))

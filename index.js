@@ -1,24 +1,11 @@
 const path = require('path')
 const express = require('express')
 const bodyParser = require('body-parser')
+const { PointStore } = require('./PointStore')
 
 const app = express()
 const port = 3001
-const pointStore = new Map()
-
-function mapGetOrInit(map, key, defaultValue) {
-    if (map.has(key))
-        return map.get(key)
-    
-    map.set(key, defaultValue)
-    return defaultValue
-}
-
-function transactionByTimestampAscending(a, b) {
-    if (a.timestamp > b.timestamp) return 1
-    else if (a.timestamp < b.timestamp) return -1
-    else return 0
-}
+const pointStore = new PointStore()
 
 function handleError(req, res, err) {
     console.log(err)
@@ -26,96 +13,6 @@ function handleError(req, res, err) {
         status: 'error',
         message: 'An unexpected error occurred'
     })
-}
-
-function addTransaction({ userPoints, payer, points, timestamp }) {
-    if (typeof payer !== 'string') {
-        return {
-            status: 'error',
-            message: `Parameter 'payer' must be a string`
-        }
-    }
-
-    const ts = Date.parse(timestamp)
-    if (isNaN(ts)) {
-        return {
-            status: 'error',
-            message: `Parameter 'timestamp' must be an ISO timestamp`
-        }
-    }
-
-    if (isNaN(points)) {
-        return {
-            status: 'error',
-            message: `Parameter 'points' must be a number`
-        }
-    }
-
-    userPoints.push({
-        payer,
-        points,
-        timestamp: ts,
-        spent: 0
-    })
-
-    return {
-        error: null,
-        message: null
-    }
-}
-
-function createSpendingPlan({ userPoints, points }) {
-    // Sort those points in time order. Clone because sort is in-place
-    const clonedPoints = [...userPoints]
-    clonedPoints.sort(transactionByTimestampAscending)
-
-    // Remove negative transactions
-    const positivePoints = []
-    clonedPoints.forEach((transaction) => {
-        if (transaction.points > 0) {
-            // Create a copy of the transaction to avoid modifying the original
-            positivePoints.push({
-                payer: transaction.payer,
-                points: transaction.points,
-                timestamp: transaction.timestamp
-            })
-        }
-        else if (transaction.points < 0) {
-            // Neutralize negative points
-            let pointsLeftToNeutralize = -transaction.points
-
-            // positivePoints is already sorted, so just filter for this payer
-            const payerPoints = positivePoints.filter(pp => pp.payer === transaction.payer)
-            for (let i = 0; i < payerPoints.length && pointsLeftToNeutralize > 0; i++) {
-                const pointsToNeutralizeNow = Math.min(pointsLeftToNeutralize, payerPoints[i].points)
-                pointsLeftToNeutralize -= pointsToNeutralizeNow
-                payerPoints[i].points -= pointsToNeutralizeNow
-            }
-        }
-        // else skip 0 point transactions
-    })
-
-    // Spend those points. Note that we have to check all transactions 
-    // in case later transactions have actually spent points from earlier 
-    // transactions
-    let pointsLeftToSpend = points
-    const payers = new Map()
-    for (let i = 0; i < positivePoints.length && pointsLeftToSpend > 0; i++) {
-        let transaction = positivePoints[i]
-
-        // We're going to spend these points. Initialize the payer in the payers Map
-        if (!payers.has(transaction.payer))
-            payers.set(transaction.payer, 0)
-
-        // Spend only as many points as are available
-        // If transaction.points == 0, this will be a no-op
-        // If transaction.points < 0, this will increase pointsLeftToSpend. We'll have to spend them in a later transaction.
-        const pointsToSpendNow = Math.min(pointsLeftToSpend, transaction.points)
-        pointsLeftToSpend -= pointsToSpendNow
-        payers.set(transaction.payer, payers.get(transaction.payer) - pointsToSpendNow)
-    }
-
-    return payers
 }
 
 app.use(bodyParser.json())
@@ -131,10 +28,8 @@ app.get('/status', (req, res) => res.status(200).send({ status: 'OK' }))
  */
 app.post('/points/user/:user/transaction', (req, res) => {
     try {
-        const userPoints = mapGetOrInit(pointStore, req.params.user, [])
-
-        let addResult = addTransaction({
-            userPoints,
+        const addResult = pointStore.addTransaction({
+            userId: req.params.user,
             payer: req.body.payer,
             points: req.body.points,
             timestamp: req.body.timestamp
@@ -152,18 +47,12 @@ app.post('/points/user/:user/transaction', (req, res) => {
     }
 })
 
+/**
+ * Retrieve the balances for a user, grouped by payer
+ */
 app.get('/points/user/:user/balances', (req, res) => {
     try {
-        const userPoints = mapGetOrInit(pointStore, req.params.user, [])
-
-        // Reduce points, matching on payer
-        let result = userPoints.reduce((acc, transaction) => {
-            // Default to 0 if the payer hasn't been initialized yet
-            const currentSum = acc.get(transaction.payer) || 0
-            acc.set(transaction.payer, currentSum + transaction.points)
-            return acc
-        }, new Map())
-
+        const result = pointStore.getBalances({ userId: req.params.user})
         res.status(200).send(Object.fromEntries(result.entries()))
     }
     catch (err) {
@@ -171,6 +60,10 @@ app.get('/points/user/:user/balances', (req, res) => {
     }
 })
 
+/**
+ * Spend points for a user, returning an array of how those points 
+ * were distributed among the payer balances
+ */
 app.post('/points/user/:user/spend', (req, res) => {
     try {
         const points = parseInt(req.body.points)
@@ -182,9 +75,8 @@ app.post('/points/user/:user/spend', (req, res) => {
             return
         }
 
-        const userPoints = mapGetOrInit(pointStore, req.params.user, [])
-        const plan = createSpendingPlan({
-            userPoints,
+        const plan = pointStore.createSpendingPlan({
+            userId: req.params.user,
             points
         })
 
@@ -201,8 +93,8 @@ app.post('/points/user/:user/spend', (req, res) => {
         const summary = []
         const timestamp = new Date().toISOString()
         plan.forEach((points, payer) => {
-            addTransaction({
-                userPoints,
+            pointStore.addTransaction({
+                userId: req.params.user,
                 payer,
                 points,
                 timestamp
